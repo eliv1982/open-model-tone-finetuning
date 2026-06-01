@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Python environments
+.venv/
+venv/
+env/
+ENV/
+
+# Hugging Face / model cache
+models/
+.cache/
+.huggingface/
+
+# Training outputs
+fine_tuning/tmp_*/
+fine_tuning/lora_model*/
+fine_tuning/lora_business_tone_cpu*/
+fine_tuning/checkpoint-*/
+**/checkpoint-*/
+
+# Model weights
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+lora_model/
+
+# Temporary lesson clone
+temp_lesson/
+
+# Logs
+logs/
+*.log
+
+# Local dataset exports (основной JSON в data/ коммитится)
+*.jsonl
+
+# OS / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Temporary files
+*.tmp
+*.temp
