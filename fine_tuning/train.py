@@ -3,17 +3,18 @@
 """
 import os
 import json
+import math
 import time
 import sys
-from datetime import datetime
-from datasets import load_dataset
+import argparse
+from datasets import Dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     TrainingArguments,
     Trainer,
-    DataCollatorForLanguageModeling,
-    TrainerCallback
+    TrainerCallback,
+    set_seed
 )
 from peft import (
     LoraConfig,
@@ -24,6 +25,45 @@ from peft import (
 import torch
 from transformers import BitsAndBytesConfig
 
+# Файлы весов, наличие которых (вместе с config.json) считается полной локальной копией модели.
+# Список совпадает с inference/preflight.py (MODEL_WEIGHT_FILES).
+MODEL_WEIGHT_FILES = (
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "pytorch_model.bin",
+    "pytorch_model.bin.index.json",
+)
+
+# Явно поддерживаемые схемы записей датасета: обязательные поля -> как собрать текст примера.
+# Записи проверяются в этом порядке; побеждает первая схема, все поля которой есть в записи.
+DATASET_SCHEMAS = {
+    ("text",): lambda e: e["text"],
+    ("instruction", "output"): lambda e: f"### Instruction:\n{e['instruction']}\n\n### Response:\n{e['output']}",
+    ("prompt", "completion"): lambda e: f"{e['prompt']}\n\n{e['completion']}",
+    ("input", "output"): lambda e: f"Input: {e['input']}\nOutput: {e['output']}",
+}
+
+class InvalidArguments(ValueError):
+    """Некорректные аргументы запуска (проверяются до загрузки модели)."""
+
+class CausalLMCollator:
+    """Динамически дополняет батч и маскирует loss только на padding-позициях."""
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, features):
+        batch = self.tokenizer.pad(features, padding=True, return_tensors="pt")
+        batch["labels"] = batch["input_ids"].clone()
+        batch["labels"].masked_fill_(batch["attention_mask"].eq(0), -100)
+        return batch
+
+def has_complete_local_model(cache_dir):
+    """True, только если в cache_dir есть config.json и хотя бы один файл весов/индекс."""
+    if not os.path.isfile(os.path.join(cache_dir, "config.json")):
+        return False
+    return any(os.path.isfile(os.path.join(cache_dir, name)) for name in MODEL_WEIGHT_FILES)
+
 def format_metric(value, fmt):
     """Безопасно форматирует метрику, даже если она пришла строкой."""
     try:
@@ -31,13 +71,77 @@ def format_metric(value, fmt):
     except (TypeError, ValueError):
         return str(value)
 
+def last_logged_loss(log_history):
+    """Последний залогированный loss (в конце обучения последняя запись - сводка без 'loss')."""
+    for entry in reversed(log_history or []):
+        if 'loss' in entry:
+            return entry['loss']
+    return 'N/A'
+
+def compute_training_steps(num_examples, batch_size, gradient_accumulation_steps, num_train_epochs):
+    """
+    Число шагов оптимизатора как в Trainer (один процесс, drop_last=False):
+    неполный последний батч и неполная группа накопления градиента тоже дают шаг.
+    Возвращает (шагов в эпохе, всего шагов).
+    """
+    batches_per_epoch = math.ceil(num_examples / batch_size)
+    steps_per_epoch = max(math.ceil(batches_per_epoch / gradient_accumulation_steps), 1)
+    return steps_per_epoch, math.ceil(num_train_epochs * steps_per_epoch)
+
+def validate_train_args(
+    *,
+    num_train_epochs,
+    per_device_train_batch_size,
+    gradient_accumulation_steps,
+    learning_rate,
+    max_length,
+    lora_r,
+    lora_alpha,
+    lora_dropout,
+    save_steps,
+    logging_steps,
+    warmup_steps,
+    seed,
+):
+    """Проверяет числовые параметры обучения до загрузки модели. Бросает InvalidArguments."""
+    def is_int(value):
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    for name, value in (
+        ("num_train_epochs", num_train_epochs),
+        ("learning_rate", learning_rate),
+        ("lora_alpha", lora_alpha),
+    ):
+        if not (math.isfinite(value) and value > 0):
+            raise InvalidArguments(f"--{name} должен быть числом > 0, получено: {value!r}")
+
+    for name, value in (
+        ("per_device_train_batch_size", per_device_train_batch_size),
+        ("gradient_accumulation_steps", gradient_accumulation_steps),
+        ("max_length", max_length),
+        ("lora_r", lora_r),
+        ("save_steps", save_steps),
+        ("logging_steps", logging_steps),
+    ):
+        if not (is_int(value) and value > 0):
+            raise InvalidArguments(f"--{name} должен быть целым числом > 0, получено: {value!r}")
+
+    if not (is_int(warmup_steps) and warmup_steps >= 0):
+        raise InvalidArguments(f"--warmup_steps должен быть целым числом >= 0, получено: {warmup_steps!r}")
+    if not (math.isfinite(lora_dropout) and 0 <= lora_dropout < 1):
+        raise InvalidArguments(f"--lora_dropout должен быть в диапазоне [0, 1), получено: {lora_dropout!r}")
+    if not (is_int(seed) and 0 <= seed < 2**32):
+        raise InvalidArguments(f"--seed должен быть целым числом от 0 до 2**32 - 1, получено: {seed!r}")
+
 class DetailedLoggingCallback(TrainerCallback):
     """Callback для детального логирования процесса обучения"""
-    
-    def __init__(self):
+
+    def __init__(self, steps_per_epoch=None):
         self.start_time = None
         self.epoch_start_time = None
-        
+        self.steps_per_epoch = steps_per_epoch
+        self.epoch_number = 0
+
     def on_train_begin(self, args, state, control, **kwargs):
         """Вызывается в начале обучения"""
         self.start_time = time.time()
@@ -49,8 +153,10 @@ class DetailedLoggingCallback(TrainerCallback):
     def on_epoch_begin(self, args, state, control, **kwargs):
         """Вызывается в начале каждой эпохи"""
         self.epoch_start_time = time.time()
-        steps = state.max_steps // int(args.num_train_epochs) if state.max_steps else '?'
-        print(f"\nЭпоха {state.epoch}/{int(args.num_train_epochs)} | Шагов: {steps}")
+        # state.epoch на начало эпохи ещё хранит число завершённых эпох (0.0 перед первой), поэтому свой счётчик
+        self.epoch_number += 1
+        steps = self.steps_per_epoch if self.steps_per_epoch else '?'
+        print(f"\nЭпоха {self.epoch_number}/{args.num_train_epochs:g} | Шагов: {steps}")
         
     def on_log(self, args, state, control, logs=None, **kwargs):
         """Вызывается при каждом логировании"""
@@ -80,13 +186,13 @@ class DetailedLoggingCallback(TrainerCallback):
     def on_epoch_end(self, args, state, control, **kwargs):
         """Вызывается в конце каждой эпохи"""
         epoch_time = time.time() - self.epoch_start_time
-        loss = state.log_history[-1].get('loss', 'N/A') if state.log_history else 'N/A'
+        loss = last_logged_loss(state.log_history)
         print(f"Эпоха {state.epoch} завершена | Время: {epoch_time/60:.1f}мин | Loss: {format_metric(loss, '.4f')}\n")
         
     def on_train_end(self, args, state, control, **kwargs):
         """Вызывается в конце обучения"""
         total_time = time.time() - self.start_time
-        loss = state.log_history[-1].get('loss', 'N/A') if state.log_history else 'N/A'
+        loss = last_logged_loss(state.log_history)
         print(f"\n{'='*60}")
         print(f"ОБУЧЕНИЕ ЗАВЕРШЕНО")
         print(f"Время: {total_time/60:.1f}мин | Шагов: {state.global_step} | Loss: {format_metric(loss, '.4f')}")
@@ -194,16 +300,9 @@ def load_model_and_tokenizer(model_name, use_4bit=True, cache_dir=None, device="
         torch_dtype = torch.float32
         print("Устройство: CPU")
     
-    # Проверяем, есть ли уже сохраненная модель локально
-    config_path = os.path.join(cache_dir, "config.json")
-    model_files = [
-        os.path.join(cache_dir, "model.safetensors"),
-        os.path.join(cache_dir, "pytorch_model.bin"),
-        os.path.join(cache_dir, "model.safetensors.index.json"),
-    ]
-    
-    has_local_model = os.path.exists(config_path) and any(os.path.exists(f) for f in model_files)
-    
+    # Проверяем, есть ли уже сохраненная полная модель локально
+    has_local_model = has_complete_local_model(cache_dir)
+
     # Попытка загрузки с обработкой ошибок quantization
     try:
         if has_local_model:
@@ -213,8 +312,7 @@ def load_model_and_tokenizer(model_name, use_4bit=True, cache_dir=None, device="
                     model = AutoModelForCausalLM.from_pretrained(
                         model_name,
                         quantization_config=bnb_config,
-                        device_map=device_map,
-                        trust_remote_code=True
+                        device_map=device_map
                     )
                     if hasattr(model, 'config'):
                         model.config.save_pretrained(cache_dir)
@@ -222,15 +320,13 @@ def load_model_and_tokenizer(model_name, use_4bit=True, cache_dir=None, device="
                     model = AutoModelForCausalLM.from_pretrained(
                         cache_dir,
                         quantization_config=bnb_config,
-                        device_map=device_map,
-                        trust_remote_code=True
+                        device_map=device_map
                     )
             else:
                 model = AutoModelForCausalLM.from_pretrained(
                     cache_dir,
                     device_map=device_map,
-                    torch_dtype=torch_dtype,
-                    trust_remote_code=True
+                    torch_dtype=torch_dtype
                 )
         else:
             # Попытка загрузки с обработкой ошибок quantization для sm_120
@@ -239,8 +335,7 @@ def load_model_and_tokenizer(model_name, use_4bit=True, cache_dir=None, device="
                     model_name,
                     quantization_config=bnb_config if use_4bit else None,
                     device_map=device_map,
-                    torch_dtype=torch_dtype,
-                    trust_remote_code=True
+                    torch_dtype=torch_dtype
                 )
                 if not use_4bit:
                     model.save_pretrained(cache_dir)
@@ -383,39 +478,101 @@ def setup_lora(model, r=16, lora_alpha=32, lora_dropout=0.05):
     
     return model
 
+def find_dataset_schema(record):
+    """Возвращает первую схему из DATASET_SCHEMAS, все поля которой есть в записи, иначе None."""
+    for schema in DATASET_SCHEMAS:
+        if all(key in record for key in schema):
+            return schema
+    return None
+
+def validate_record(record, where):
+    """
+    Проверяет одну запись датасета: объект, поддерживаемая схема, обязательные поля - непустые строки.
+    where - расположение записи для сообщения об ошибке (файл, строка/номер записи).
+    """
+    if not isinstance(record, dict):
+        raise ValueError(f"{where}: запись должна быть JSON-объектом, получено: {type(record).__name__}")
+
+    schema = find_dataset_schema(record)
+    if schema is None:
+        supported = "; ".join(" + ".join(s) for s in DATASET_SCHEMAS)
+        raise ValueError(
+            f"{where}: неподдерживаемая запись (ключи: {sorted(record)}). Поддерживаются схемы: {supported}"
+        )
+
+    for key in schema:
+        value = record[key]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{where}: поле '{key}' должно быть непустой строкой, получено: {value!r}")
+
+def format_example(example):
+    """Собирает текст обучающего примера по поддерживаемой схеме (запись должна быть валидной)."""
+    schema = find_dataset_schema(example)
+    if schema is None:
+        raise ValueError(f"Неподдерживаемая запись датасета (ключи: {sorted(example)})")
+    return DATASET_SCHEMAS[schema](example)
+
 def load_dataset_from_file(dataset_path):
     """
-    Загружает датасет из файла
-    
+    Загружает и строго проверяет датасет из файла
+
     Поддерживаемые форматы:
-    - JSON файл с полем 'text' или 'instruction'/'output'
-    - JSONL файл (каждая строка - JSON объект)
+    - JSON: список записей ИЛИ объект с ключом 'data', содержащим список записей
+    - JSONL: каждая непустая строка - JSON-объект (пустые строки пропускаются)
+
+    Запись - объект с одной из схем из DATASET_SCHEMAS ('text'; 'instruction'+'output';
+    'prompt'+'completion'; 'input'+'output'), обязательные поля - непустые строки.
+    Некорректный JSON, неподдерживаемая запись или пустой датасет - ValueError с указанием места.
     """
     print(f"{'='*60}")
     print(f"ЗАГРУЗКА ДАТАСЕТА: {os.path.basename(dataset_path)}")
     print(f"{'='*60}")
-    
+
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Файл датасета не найден: {dataset_path}")
-    
+
     load_start = time.time()
-    
+    file_name = os.path.basename(dataset_path)
+
+    # utf-8-sig: файлы из Windows-редакторов могут начинаться с BOM
     if dataset_path.endswith('.jsonl'):
         data = []
-        with open(dataset_path, 'r', encoding='utf-8') as f:
-            for line in f:
+        with open(dataset_path, 'r', encoding='utf-8-sig') as f:
+            for line_number, line in enumerate(f, start=1):
+                if not line.strip():
+                    continue
+                where = f"{file_name}, строка {line_number}"
                 try:
-                    data.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"{where}: некорректный JSON ({exc.msg}, столбец {exc.colno})") from exc
+                validate_record(record, where)
+                data.append(record)
     elif dataset_path.endswith('.json'):
-        with open(dataset_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            if isinstance(data, dict):
-                data = list(data.values())[0] if data else []
+        with open(dataset_path, 'r', encoding='utf-8-sig') as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"{file_name}: некорректный JSON ({exc.msg}, строка {exc.lineno}, столбец {exc.colno})"
+                ) from exc
+        if isinstance(data, dict):
+            if 'data' not in data:
+                raise ValueError(
+                    f"{file_name}: ожидается список записей или объект с ключом 'data', "
+                    f"получен объект с ключами: {sorted(data)}"
+                )
+            data = data['data']
+        if not isinstance(data, list):
+            raise ValueError(f"{file_name}: коллекция записей должна быть списком, получено: {type(data).__name__}")
+        for record_number, record in enumerate(data, start=1):
+            validate_record(record, f"{file_name}, запись {record_number}")
     else:
         raise ValueError("Поддерживаются только .json и .jsonl файлы")
-    
+
+    if not data:
+        raise ValueError(f"{file_name}: датасет пуст, нет ни одной записи")
+
     load_time = time.time() - load_start
     file_size = os.path.getsize(dataset_path) / 1024**2
     print(f"Примеров: {len(data)} | Размер: {file_size:.1f}MB | Время: {load_time:.1f}с\n")
@@ -427,85 +584,56 @@ def preprocess_dataset(data, tokenizer, max_length=512):
     Предобрабатывает датасет для обучения
     
     Args:
-        data: список словарей с данными
+        data: список проверенных записей (см. load_dataset_from_file)
         tokenizer: токенизатор
         max_length: максимальная длина последовательности
     """
     print(f"{'='*60}")
     print(f"ПРЕДОБРАБОТКА | max_length={max_length}")
     print(f"{'='*60}")
-    
+
     preprocess_start = time.time()
-    
-    def format_prompt(example):
-        """
-        Форматирует пример в промпт
-        Поддерживает разные форматы датасета
-        """
-        if 'text' in example:
-            # Простой текст
-            return example['text']
-        elif 'instruction' in example and 'output' in example:
-            # Формат instruction-output
-            return f"### Instruction:\n{example['instruction']}\n\n### Response:\n{example['output']}"
-        elif 'prompt' in example and 'completion' in example:
-            # Формат prompt-completion
-            return f"{example['prompt']}\n\n{example['completion']}"
-        elif 'input' in example and 'output' in example:
-            # Формат input-output
-            return f"Input: {example['input']}\nOutput: {example['output']}"
-        else:
-            # Пытаемся найти любой текстовый ключ
-            text_keys = [k for k in example.keys() if 'text' in k.lower() or 'content' in k.lower()]
-            if text_keys:
-                return example[text_keys[0]]
-            else:
-                return str(example)
-    
+
+    # Сразу приводим все записи к тексту: так записи с разными схемами и лишними полями
+    # не портят таблицу datasets
+    texts = [format_example(example) for example in data]
+
     # Анализ длины текстов (только статистика)
     text_lengths = []
-    for example in data[:min(100, len(data))]:
-        text = format_prompt(example)
+    for text in texts[:100]:
         tokens = tokenizer.encode(text, add_special_tokens=False)
         text_lengths.append(len(tokens))
     
     if text_lengths:
         avg_tokens = sum(text_lengths) / len(text_lengths)
-        truncated = sum(1 for t in text_lengths if t > max_length)
+        truncated = sum(1 for t in text_lengths if t + 1 > max_length)
         print(f"Средняя длина: {avg_tokens:.0f} токенов | Обрезано: {truncated}/{len(text_lengths)}")
+
+    if tokenizer.eos_token_id is None:
+        raise ValueError("Токенизатор должен иметь eos_token_id для завершения обучающих примеров")
     
     def tokenize_function(examples):
-        """
-        Токенизирует примеры
-        При batched=True examples - это словарь со списками значений
-        """
-        # Преобразуем batched формат в список словарей
-        # examples это словарь вида {'instruction': [list], 'output': [list], ...}
-        batch_size = len(list(examples.values())[0])
-        examples_list = []
-        for i in range(batch_size):
-            example_dict = {key: examples[key][i] for key in examples.keys()}
-            examples_list.append(example_dict)
-        
-        # Форматируем каждый пример
-        texts = [format_prompt(ex) for ex in examples_list]
-        
-        # Токенизация (без return_tensors, чтобы вернуть списки)
-        tokenized = tokenizer(
-            texts,
-            truncation=True,
-            max_length=max_length,
-            padding="max_length"
-        )
-        
-        # Добавляем labels (копия input_ids)
-        tokenized["labels"] = tokenized["input_ids"].copy()
-        
-        return tokenized
+        # Резервируем последний слот под EOS; padding добавит collator до длины текущего батча.
+        if max_length == 1:
+            input_ids = [[] for _ in examples["text"]]
+        else:
+            input_ids = tokenizer(
+                examples["text"],
+                add_special_tokens=False,
+                truncation=True,
+                max_length=max_length - 1,
+                padding=False,
+                return_attention_mask=False,
+            )["input_ids"]
+
+        input_ids = [ids + [tokenizer.eos_token_id] for ids in input_ids]
+        return {
+            "input_ids": input_ids,
+            "attention_mask": [[1] * len(ids) for ids in input_ids],
+        }
     
     # Преобразуем в формат для datasets
-    from datasets import Dataset
-    dataset = Dataset.from_list(data)
+    dataset = Dataset.from_list([{"text": text} for text in texts])
     
     # Токенизация
     tokenized_dataset = dataset.map(
@@ -538,7 +666,8 @@ def train(
     save_steps=500,
     logging_steps=10,
     warmup_steps=100,
-    device="auto"
+    device="auto",
+    seed=42
 ):
     """
     Основная функция обучения
@@ -559,7 +688,24 @@ def train(
         save_steps: шаги сохранения
         logging_steps: шаги логирования
         warmup_steps: шаги warmup
+        seed: seed для воспроизводимости (инициализация LoRA, порядок данных, dropout)
     """
+    # Числовые параметры проверяем первыми - до загрузки датасета и модели
+    validate_train_args(
+        num_train_epochs=num_train_epochs,
+        per_device_train_batch_size=per_device_train_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        learning_rate=learning_rate,
+        max_length=max_length,
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        save_steps=save_steps,
+        logging_steps=logging_steps,
+        warmup_steps=warmup_steps,
+        seed=seed,
+    )
+
     if device not in {"auto", "cpu", "cuda"}:
         raise ValueError("device должен быть одним из: auto, cpu, cuda")
 
@@ -576,7 +722,13 @@ def train(
     # Вывод информации о системе
     print_system_info()
     print(f"Выбранное устройство: {resolved_device}")
-    
+
+    # Датасет читаем и проверяем до загрузки модели: ошибка в данных не должна стоить загрузки весов
+    data = load_dataset_from_file(dataset_path)
+
+    # Seed до загрузки модели: он влияет на случайную инициализацию LoRA-матриц
+    set_seed(seed)
+
     # Определяем директорию для сохранения обученной модели (в проекте)
     if not os.path.isabs(output_dir):
         # Если путь относительный, делаем его относительно корня проекта
@@ -616,20 +768,16 @@ def train(
         model = model.to(resolved_device)
         print(f"[OK] Модель перемещена на {resolved_device}")
     
-    # Загрузка датасета
-    data = load_dataset_from_file(dataset_path)
+    # Токенизация датасета (сам датасет уже загружен и проверен выше)
     train_dataset = preprocess_dataset(data, tokenizer, max_length=max_length)
-    
-    # Data collator
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False  # Causal LM, не masked LM
+
+    data_collator = CausalLMCollator(tokenizer)
+
+    # Вычисляем количество шагов так же, как Trainer (с учётом неполных батчей)
+    steps_per_epoch, total_steps = compute_training_steps(
+        len(train_dataset), per_device_train_batch_size, gradient_accumulation_steps, num_train_epochs
     )
-    
-    # Вычисляем общее количество шагов
-    total_steps = len(train_dataset) // (per_device_train_batch_size * gradient_accumulation_steps) * num_train_epochs
-    steps_per_epoch = len(train_dataset) // (per_device_train_batch_size * gradient_accumulation_steps)
-    
+
     print("\n" + "="*80)
     print("НАСТРОЙКА ПАРАМЕТРОВ ОБУЧЕНИЯ")
     print("="*80)
@@ -644,6 +792,7 @@ def train(
     print(f"Warmup шагов: {warmup_steps}")
     print(f"Шаги логирования: {logging_steps}")
     print(f"Шаги сохранения: {save_steps}")
+    print(f"Seed: {seed}")
     use_gradient_checkpointing = False  # Инициализация
     
     # Проверка конкретной GPU модели
@@ -700,6 +849,7 @@ def train(
         logging_steps=logging_steps,
         save_steps=save_steps,
         warmup_steps=warmup_steps,
+        seed=seed,  # порядок данных и dropout; data_seed по умолчанию берётся из seed
         save_total_limit=3,
         load_best_model_at_end=False,
         report_to="none",
@@ -721,7 +871,7 @@ def train(
         args=training_args,
         train_dataset=train_dataset,
         data_collator=data_collator,
-        callbacks=[DetailedLoggingCallback()],
+        callbacks=[DetailedLoggingCallback(steps_per_epoch)],
     )
     
     # Убеждаемся что модель на нужном устройстве перед обучением
@@ -736,7 +886,7 @@ def train(
                 args=training_args,
                 train_dataset=train_dataset,
                 data_collator=data_collator,
-                callbacks=[DetailedLoggingCallback()],
+                callbacks=[DetailedLoggingCallback(steps_per_epoch)],
             )
     except Exception:
         model = model.to(resolved_device)
@@ -745,7 +895,7 @@ def train(
             args=training_args,
             train_dataset=train_dataset,
             data_collator=data_collator,
-            callbacks=[DetailedLoggingCallback()],
+            callbacks=[DetailedLoggingCallback(steps_per_epoch)],
         )
     
     # Информация о памяти перед обучением
@@ -767,7 +917,7 @@ def train(
     train_time = time.time() - train_start
     
     # Финальная статистика
-    loss = trainer.state.log_history[-1].get('loss', 'N/A') if trainer.state.log_history else 'N/A'
+    loss = last_logged_loss(trainer.state.log_history)
     speed = len(train_dataset) * num_train_epochs / train_time if train_time > 0 else 0
     print(f"\n{'='*60}")
     print(f"ОБУЧЕНИЕ ЗАВЕРШЕНО")
@@ -782,9 +932,7 @@ def train(
     save_time = time.time() - save_start
     print(f"[OK] Сохранено за {save_time:.1f}с | Путь: {os.path.abspath(output_dir)}")
 
-if __name__ == "__main__":
-    import argparse
-    
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Fine-tuning модели с LoRA")
     parser.add_argument("--model_name", type=str, required=True, help="Имя модели с HuggingFace")
     parser.add_argument("--dataset_path", type=str, required=True, help="Путь к датасету (.json или .jsonl)")
@@ -802,25 +950,34 @@ if __name__ == "__main__":
     parser.add_argument("--logging_steps", type=int, default=10, help="Шаги логирования")
     parser.add_argument("--warmup_steps", type=int, default=100, help="Шаги warmup")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="Устройство для обучения")
-    
-    args = parser.parse_args()
-    
-    train(
-        model_name=args.model_name,
-        dataset_path=args.dataset_path,
-        output_dir=args.output_dir,
-        num_train_epochs=args.num_train_epochs,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
-        max_length=args.max_length,
-        use_4bit=args.use_4bit,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        save_steps=args.save_steps,
-        logging_steps=args.logging_steps,
-        warmup_steps=args.warmup_steps,
-        device=args.device,
-    )
+    parser.add_argument("--seed", type=int, default=42, help="Seed для воспроизводимости (по умолчанию 42)")
+
+    args = parser.parse_args(argv)
+
+    try:
+        train(
+            model_name=args.model_name,
+            dataset_path=args.dataset_path,
+            output_dir=args.output_dir,
+            num_train_epochs=args.num_train_epochs,
+            per_device_train_batch_size=args.per_device_train_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            learning_rate=args.learning_rate,
+            max_length=args.max_length,
+            use_4bit=args.use_4bit,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            save_steps=args.save_steps,
+            logging_steps=args.logging_steps,
+            warmup_steps=args.warmup_steps,
+            device=args.device,
+            seed=args.seed,
+        )
+    except InvalidArguments as exc:
+        # train() проверяет аргументы до любой тяжёлой работы, поэтому ошибка приходит сразу
+        parser.error(str(exc))
+
+if __name__ == "__main__":
+    main()
 

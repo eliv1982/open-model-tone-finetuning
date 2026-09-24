@@ -7,11 +7,24 @@ import os
 
 import torch
 from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
+
+from preflight import has_complete_local_model, validate_generation_args, validate_lora_adapter
+
+
+def build_prompt(instruction):
+    """Промпт в том же формате, что при обучении (train.py)."""
+    return f"### Instruction:\n{instruction}\n\n### Response:\n"
 
 
 def load_model_and_tokenizer(base_model_name, lora_model_path=None):
-    """Загружает базовую модель (локально или с HF) и опционально объединяет LoRA."""
+    """
+    Загружает базовую модель (локально или с HF) и опционально объединяет LoRA.
+    Если lora_model_path задан, адаптер обязан загрузиться: иначе исключение, а не baseline.
+    """
+    if lora_model_path is not None:
+        validate_lora_adapter(lora_model_path)
+
     if torch.cuda.is_available():
         torch_dtype = torch.float16
         device_map = "auto"
@@ -27,7 +40,7 @@ def load_model_and_tokenizer(base_model_name, lora_model_path=None):
     )
     os.makedirs(base_model_cache_dir, exist_ok=True)
 
-    has_local_model = os.path.exists(os.path.join(base_model_cache_dir, "config.json"))
+    has_local_model = has_complete_local_model(base_model_cache_dir)
     model_path = base_model_cache_dir if has_local_model else base_model_name
 
     tokenizer_config_path = os.path.join(base_model_cache_dir, "tokenizer_config.json")
@@ -45,7 +58,6 @@ def load_model_and_tokenizer(base_model_name, lora_model_path=None):
         model_path,
         torch_dtype=torch_dtype,
         device_map=device_map,
-        trust_remote_code=True,
     )
 
     if not has_local_model:
@@ -54,13 +66,11 @@ def load_model_and_tokenizer(base_model_name, lora_model_path=None):
     if device_map is None:
         model = model.to(device)
 
-    if lora_model_path and os.path.exists(lora_model_path):
+    if lora_model_path is not None:
         model = PeftModel.from_pretrained(model, lora_model_path)
         model = model.merge_and_unload()
         if device_map is None:
             model = model.to(device)
-    elif lora_model_path:
-        print(f"Предупреждение: путь LoRA не найден: {lora_model_path}. Используется базовая модель.")
 
     model.eval()
     return model, tokenizer, device
@@ -74,6 +84,7 @@ def generate_once(
     max_new_tokens,
     temperature,
     top_p,
+    seed=42,
 ):
     inputs = tokenizer(
         formatted_prompt,
@@ -88,6 +99,7 @@ def generate_once(
     attention_mask = inputs["attention_mask"].to(target_device)
     input_length = input_ids.shape[1]
 
+    set_seed(seed)
     with torch.no_grad():
         output_ids = model.generate(
             input_ids,
@@ -106,19 +118,33 @@ def generate_once(
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Один запрос к модели в формате ### Instruction / ### Response"
     )
     parser.add_argument("--base_model", type=str, required=True, help="Базовая модель Hugging Face")
-    parser.add_argument("--lora_model", type=str, default=None, help="Путь к LoRA-адаптеру")
+    parser.add_argument(
+        "--lora_model",
+        type=str,
+        default=None,
+        help="Путь к LoRA-адаптеру. Если задан, но адаптер не найден/некорректен - ошибка, а не baseline",
+    )
     parser.add_argument("--prompt", type=str, required=True, help="Текст instruction (вопрос)")
     parser.add_argument("--max_new_tokens", type=int, default=120, help="Макс. новых токенов")
     parser.add_argument("--temperature", type=float, default=0.2, help="Температура сэмплирования")
     parser.add_argument("--top_p", type=float, default=0.85, help="Nucleus sampling top_p")
-    args = parser.parse_args()
+    parser.add_argument("--seed", type=int, default=42, help="Seed сэмплирования (по умолчанию 42)")
+    args = parser.parse_args(argv)
 
-    formatted_prompt = f"### Instruction:\n{args.prompt}\n\n### Response:\n"
+    # Все проверки - до загрузки модели
+    try:
+        validate_generation_args("max_new_tokens", args.max_new_tokens, args.temperature, args.top_p)
+        if args.lora_model is not None:
+            validate_lora_adapter(args.lora_model)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    formatted_prompt = build_prompt(args.prompt)
 
     model, tokenizer, device = load_model_and_tokenizer(args.base_model, args.lora_model)
 
@@ -130,13 +156,15 @@ def main():
         args.max_new_tokens,
         args.temperature,
         args.top_p,
+        args.seed,
     )
 
     print(f"Базовая модель: {args.base_model}")
-    if args.lora_model:
-        print(f"LoRA: {args.lora_model}")
+    # Сюда доходим, только если адаптер реально загружен (иначе выше было бы исключение)
+    if args.lora_model is not None:
+        print(f"LoRA: {args.lora_model} (адаптер загружен и объединён с базовой моделью)")
     else:
-        print("LoRA: не используется")
+        print("LoRA: не используется (baseline)")
     print(f"Вопрос: {args.prompt}")
     print(f"Ответ: {answer}")
 

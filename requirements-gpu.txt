@@ -1,0 +1,4 @@
+# Необязательно: только для GPU-режима train.py --use_4bit (на CPU не нужно).
+# Нужна также сборка PyTorch с поддержкой CUDA.
+-r requirements.txt
+bitsandbytes>=0.41.0

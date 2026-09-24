@@ -4,17 +4,23 @@
 import os
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import PeftModel, PeftConfig
+from peft import PeftModel
 import argparse
+
+from preflight import has_complete_local_model, validate_generation_args, validate_lora_adapter
 
 def load_model_and_tokenizer(base_model_name, lora_model_path=None):
     """
     Загружает модель и токенизатор
-    
+
     Args:
         base_model_name: имя базовой модели с HuggingFace
-        lora_model_path: путь к дообученной LoRA модели (опционально)
+        lora_model_path: путь к дообученной LoRA модели (опционально).
+            Если задан, адаптер обязан загрузиться: иначе исключение, а не baseline.
     """
+    if lora_model_path is not None:
+        validate_lora_adapter(lora_model_path)
+
     print(f"Загрузка модели {base_model_name}...")
     
     # Проверка наличия GPU
@@ -50,10 +56,9 @@ def load_model_and_tokenizer(base_model_name, lora_model_path=None):
     base_model_cache_dir = os.path.join(project_root, "models", base_model_name.replace("/", "_"))
     os.makedirs(base_model_cache_dir, exist_ok=True)
     
-    config_path = os.path.join(base_model_cache_dir, "config.json")
-    has_local_model = os.path.exists(config_path)
-    
-    # Проверяем, есть ли локальная копия модели
+    has_local_model = has_complete_local_model(base_model_cache_dir)
+
+    # Проверяем, есть ли полная локальная копия модели (config.json + файл весов)
     if has_local_model:
         print(f"Использование локальной копии модели из {base_model_cache_dir}")
         model_path = base_model_cache_dir
@@ -82,8 +87,7 @@ def load_model_and_tokenizer(base_model_name, lora_model_path=None):
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch_dtype,
-        device_map=device_map,
-        trust_remote_code=True
+        device_map=device_map
     )
     
     # Сохраняем модель локально, если она была скачана
@@ -103,14 +107,14 @@ def load_model_and_tokenizer(base_model_name, lora_model_path=None):
             print(f"  GPU {i}: {allocated:.2f}GB / {reserved:.2f}GB (свободно: {free:.2f}GB)")
     
     # Загрузка LoRA весов если указан путь
-    if lora_model_path and os.path.exists(lora_model_path):
+    if lora_model_path is not None:
         print(f"Загрузка LoRA весов из {lora_model_path}...")
         model = PeftModel.from_pretrained(model, lora_model_path)
         model = model.merge_and_unload()  # Объединяем LoRA веса с базовой моделью
         print("LoRA веса успешно загружены и объединены!")
-    elif lora_model_path:
-        print(f"Предупреждение: Путь {lora_model_path} не найден. Используется базовая модель.")
-    
+    else:
+        print("LoRA не используется (baseline)")
+
     # Переводим модель в режим оценки
     model.eval()
     
@@ -129,6 +133,8 @@ def generate_response(model, tokenizer, prompt, max_length=512, temperature=0.7,
         top_p: nucleus sampling параметр
         top_k: top-k sampling параметр
     """
+    validate_generation_args("max_length", max_length, temperature, top_p, top_k)
+
     # Токенизация промпта
     inputs = tokenizer.encode(prompt, return_tensors="pt")
     
@@ -254,16 +260,29 @@ def chat_loop(model, tokenizer, system_prompt="", max_length=512, temperature=0.
             print(f"\nОшибка: {e}\n")
             continue
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Чат с моделью в терминале")
     parser.add_argument("--base_model", type=str, required=True, help="Имя базовой модели с HuggingFace")
-    parser.add_argument("--lora_model", type=str, default=None, help="Путь к дообученной LoRA модели")
+    parser.add_argument(
+        "--lora_model",
+        type=str,
+        default=None,
+        help="Путь к дообученной LoRA модели. Если задан, но адаптер не найден/некорректен - ошибка, а не baseline",
+    )
     parser.add_argument("--system_prompt", type=str, default="", help="Системный промпт")
     parser.add_argument("--max_length", type=int, default=512, help="Максимальная длина ответа")
     parser.add_argument("--temperature", type=float, default=0.7, help="Температура генерации")
-    
-    args = parser.parse_args()
-    
+
+    args = parser.parse_args(argv)
+
+    # Все проверки - до загрузки модели
+    try:
+        validate_generation_args("max_length", args.max_length, args.temperature)
+        if args.lora_model is not None:
+            validate_lora_adapter(args.lora_model)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     # Загрузка модели
     model, tokenizer = load_model_and_tokenizer(args.base_model, args.lora_model)
     
